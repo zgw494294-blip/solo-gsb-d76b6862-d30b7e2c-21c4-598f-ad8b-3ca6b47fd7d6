@@ -22,6 +22,10 @@ let solveTimer = null;
 let lastErrorKey = "";
 let inflightToken = 0;
 let lastSolveResult = null; // 最近一次成功的求解结果（供过渡面板重置/默认上限）
+// lastSolveResult 对应的求解输入纪元：只有它 === solveInputEpoch 时，该顺序才是
+// 「当前校准输入对应的有效求解顺序」。输入变化后新求解尚未返回 / 求解失败 / 输入非法
+// 期间该值与当前纪元不一致，合成预览一律禁用，直接调用 runComposite 也不会发请求。
+let lastSolveEpoch = 0;
 
 // 原求解与成环解除流程共用的输入纪元：图层、样本或关系每变化一次就 +1（只增不减）。
 // 三类请求（原求解 / 解除方案 / 确认解除）发出时记录当前纪元；响应落地前纪元若已变，
@@ -31,6 +35,10 @@ let solveInputEpoch = 0;
 
 function noteSolveInputChanged() {
   solveInputEpoch += 1;
+  // 校准输入（图层 / 样本 / 关系）变化同样属于合成相关输入变化：合成纪元同步 +1
+  // （只增不减，改回原值也不回落），markCompositeStaleness 会立即撤销旧预览下载
+  // 资格与在途合成资格，无需等待任何在途求解 / 合成完成。
+  compositeState.epoch += 1;
   markCompositeStaleness(); // 图层 / 样本 / 关系变化也立即撤销旧合成预览的下载资格
 }
 
@@ -472,6 +480,7 @@ async function runSolve() {
       const errors = data.errors || [{ scope: "form", message: "求解失败" }];
       showErrors(errors);
       lastSolveResult = null; // 无有效求解结果：禁用合成预览生成
+      lastSolveEpoch = 0;     // 输入非法 / 求解失败：旧顺序不再对应当前输入
       updateCompositeRunBtn();
       // 是否成环、以及待确认解除方案，都以 /api/resolve-cycle 的判定为准；
       // 其他非法输入（无环 / 混有别的错误）时该伴随请求不会展示方案卡片。
@@ -479,6 +488,7 @@ async function runSolve() {
     } else {
       showErrors([]);
       lastSolveResult = data;
+      lastSolveEpoch = epoch; // 记录该有效求解顺序对应的输入纪元
       clearCyclePlan();
       renderResult(data);
       updateCompositeRunBtn();
@@ -486,6 +496,9 @@ async function runSolve() {
   } catch (err) {
     if (!solveResponseCurrent(token, epoch)) return;
     showErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+    // 尚未取得当前输入的求解结果（连接异常）：旧顺序不再对应当前输入，禁止合成
+    lastSolveResult = null;
+    lastSolveEpoch = 0;
     updateCompositeRunBtn();
   }
 }
@@ -2170,6 +2183,10 @@ async function confirmCyclePlan() {
     clearCyclePlan();
     showErrors([]);
     lastSolveResult = data;
+    // 确认成功后移除关系并触发纪元 +1，data 正是新输入下的有效求解结果：
+    // 以当前纪元锚定，合成预览可立即使用该顺序
+    lastSolveEpoch = solveInputEpoch;
+    updateCompositeRunBtn();
     renderResult(data);
   } catch (err) {
     if (!cycleResponseCurrent("confirm", reqId, reqEpoch)) return;
@@ -2183,16 +2200,23 @@ async function confirmCyclePlan() {
 
 // ============================================================ 背景图片合成预览 ==
 
-// 把「当前有效的最佳叠序」（最近一次成功求解的 order）叠到上传的背景图每个像素上。
+// 把「当前有效的最佳叠序」（最近一次成功求解、且仍对应当前校准输入的 order）
+// 叠到上传的背景图每个像素上。
 //
 // 失效与请求竞态规则（与求解 / 反推 / 过渡同样严格）：
-//  - 合成纪元 epoch：图层、样本、关系（走 noteSolveInputChanged）或已选图片
-//    每次变化都 +1，只增不减；旧预览的下载资格立即撤销，即使把输入或图片改回原值
-//    也不会恢复（纪元不回落）。
-//  - 合成请求 reqSeq：永不归零的单调序号；连续生成只接纳「最近一次且输入未变」的请求，
-//    上传或图片解码（响应体读取）期间输入 / 图片发生变化也丢弃旧结果。
-//  - 没有有效求解结果（尚无成功求解、或当前输入有错误）时禁用生成；生成失败不改动
-//    任何校准输入。
+//  - 合成纪元 epoch：图层、样本、关系（noteSolveInputChanged 内同步 +1 并立即
+//    调 markCompositeStaleness）或已选图片（选择的第一时间，先于解码）每次变化
+//    都 +1，只增不减；旧预览下载资格与在途合成资格立即撤销，即使把输入或图片
+//    改回原值也不会恢复（纪元不回落）。
+//  - 有效求解顺序：lastSolveResult 锚定其产生时的求解输入纪元 lastSolveEpoch；
+//    只有 lastSolveEpoch === solveInputEpoch 时该顺序才可用于生成。新求解在途、
+//    求解失败（HTTP 400）、连接异常或输入非法期间一律禁用，直接调用 runComposite
+//    也不发请求。
+//  - 合成请求 reqSeq：永不归零的单调序号；连续选图 / 生成只接纳「最近一次且相关
+//    输入始终未变」的操作，上传、图片解码或响应体读取期间输入 / 图片发生变化也
+//    丢弃旧操作——无论成功、HTTP 错误、连接异常还是解析失败，都不改动预览、错误
+//    或较新操作的加载状态。
+//  - 生成失败不改动任何校准输入。
 const compositeState = {
   file: null,          // 当前选中的 File（未重新上传即不变）
   fileMeta: "",        // 展示用「文件名 W×H」
@@ -2212,7 +2236,8 @@ const elCompositeHint = $("#compositeHint");
 const elCompositeErrors = $("#compositeErrors");
 const elCompositeResult = $("#compositeResult");
 
-// 图层 / 样本 / 关系变化时由 noteSolveInputChanged 调用；图片变化时在选择处理里调用
+// 图层 / 样本 / 关系变化时由 noteSolveInputChanged（合成纪元已先同步 +1）调用；
+// 图片变化时在选择处理的最开始调用。
 function markCompositeStaleness() {
   // 在途请求若发出后纪元已变，立即摘除其在途身份并结束加载态；
   // 旧响应返回后（含上传 / 读取响应体期间的变化）一律在守卫处丢弃。
@@ -2233,11 +2258,21 @@ function markCompositeStaleness() {
   renderCompositeResultIfAny();
 }
 
+// 生成只可使用「当前校准输入对应的有效求解顺序」：最近一次成功求解必须仍锚定在
+// 当前求解输入纪元上。尚未取得结果（自动求解在途）、求解失败（HTTP 400）、连接
+// 异常或输入非法时均为 false；输入变化后即使改回原值，旧求解的纪元也已落后。
+function compositeSolveOrderValid() {
+  return !!lastSolveResult && lastSolveEpoch === solveInputEpoch;
+}
+
 function updateCompositeRunBtn() {
-  const can = !!lastSolveResult && !!compositeState.file && compositeState.inflightId === 0;
+  const can =
+    compositeSolveOrderValid() &&
+    !!compositeState.file &&
+    compositeState.inflightId === 0;
   elCompositeRunBtn.disabled = !can;
-  if (!lastSolveResult) {
-    elCompositeHint.textContent = "没有有效求解结果时无法生成";
+  if (!compositeSolveOrderValid()) {
+    elCompositeHint.textContent = "当前校准输入尚无有效求解结果（等待重新求解 / 求解失败 / 输入非法），无法生成";
   } else if (!compositeState.file) {
     elCompositeHint.textContent = "请先选择一张不超过 2 MiB、宽高各不超过 512 像素的 RGB PNG 背景图";
   } else if (compositeState.inflightId !== 0) {
@@ -2258,18 +2293,19 @@ elCompositeFile.addEventListener("change", () => {
 });
 
 async function selectCompositeFile(file) {
-  // 换新文件（含清空选择）即相关输入变化：纪元 +1，旧预览立即失去下载资格。
-  // 记下本次选择的纪元：probeImage 是异步的，快速连续选两次时，较早一次的解码
+  // 换图（含清空选择）即相关输入变化：纪元 +1（只增不减）并【立即】调用
+  // markCompositeStaleness——不等待图片解码完成：旧预览下载链接、在途合成资格与
+  // 加载态在选择发生的同一时刻就被撤销 / 结束；已登记的 File 也立即摘除，杜绝
+  // 「解码期间用旧请求资格 + 新输入 / 新图片」的窗口。记下本次选择的纪元：
+  // probeImage 是异步的，快速连续选两次或解码期间校准输入又变时，较早一次的解码
   // 可能在较新一次之后才完成——落地前必须确认纪元未变，否则旧结果一律丢弃。
   const selectEpoch = compositeState.epoch + 1;
   compositeState.epoch = selectEpoch;
   compositeState.file = null;
   elCompositeFileHint.textContent = "";
-  if (!file) {
-    showCompositeErrors([]);
-    markCompositeStaleness();
-    return;
-  }
+  showCompositeErrors([]);
+  markCompositeStaleness();
+  if (!file) return;
   // 客户端预检：扩展名 / MIME、体积；再用浏览器解码确认可解码与尺寸（最终以服务端判定为准）。
   const errs = [];
   const nameOk = /\.png$/i.test(file.name) || file.type === "image/png";
@@ -2350,7 +2386,11 @@ function compositeResponseCurrent(reqId, reqEpoch) {
 
 async function runComposite() {
   const solve = lastSolveResult;
-  if (!solve || !compositeState.file || compositeState.inflightId !== 0) return;
+  // 直接调用也不得发送请求：必须同时满足「当前输入对应的有效求解顺序」「已选图片
+  // （客户端预检通过）」「无在途合成」三项；缺少当前有效求解（尚未返回 / 失败 /
+  // 非法）、旧求解纪元落后或输入被改回原值但尚未重新求解时一律直接返回。
+  if (!compositeSolveOrderValid() || !solve ||
+      !compositeState.file || compositeState.inflightId !== 0) return;
   const reqId = ++compositeState.reqSeq;
   const reqEpoch = compositeState.epoch;
   compositeState.inflightId = reqId;
@@ -2358,6 +2398,7 @@ async function runComposite() {
   updateCompositeRunBtn();
   elCompositeStatus.textContent = "生成中…";
   elCompositeStatus.className = "status busy";
+  elCompositeErrors.hidden = true;
 
   const payload = {
     ...buildSolvePayload(),
@@ -2389,12 +2430,19 @@ async function runComposite() {
     }
     showCompositeErrors([]);
     revokeCompositeResultUrls();
+    // 回显头异常（缺失 / 非 JSON）时回退到本次提交的顺序，不让解析异常吞掉有效响应
+    let respOrder = null;
+    const orderHeader = resp.headers.get("X-Composite-Order");
+    if (orderHeader) {
+      try {
+        const parsed = JSON.parse(orderHeader);
+        if (Array.isArray(parsed)) respOrder = parsed;
+      } catch (_) { /* 回退到提交顺序 */ }
+    }
     compositeState.result = {
       blobUrl: URL.createObjectURL(blob),
       origUrl: URL.createObjectURL(compositeState.file),
-      order: resp.headers.get("X-Composite-Order")
-        ? JSON.parse(resp.headers.get("X-Composite-Order"))
-        : [...solve.order],
+      order: respOrder || [...solve.order],
       width: Number(resp.headers.get("X-Composite-Width")),
       height: Number(resp.headers.get("X-Composite-Height")),
       epoch: reqEpoch,
